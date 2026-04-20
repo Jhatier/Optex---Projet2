@@ -1,0 +1,565 @@
+import os
+from pathlib import Path
+import cv2
+import numpy as np
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+INPUT_PATH = "Vidéos_traitées"
+OUTPUT_ROOT = "video_traitee_temperature"
+
+# Vidéo / calibration
+REAL_FPS = 30
+PIXEL_SIZE = 4.43e-4          # m/pixel
+OUTPUT_VIDEO_FPS = 4
+RESIZE_FACTOR = 0.7
+
+# Farneback
+PYR_SCALE = 0.5
+LEVELS = 3
+WINSIZE = 15
+ITERATIONS = 3
+POLY_N = 5
+POLY_SIGMA = 1.2
+FLAGS = 0
+
+# Modèle thermique par bilan de forces
+T_BACKGROUND_C = 20.0
+G = 9.81
+L_CHAR_M = 0.008               # longueur caractéristique ; à ajuster
+
+# Échelle visuelle
+DISPLAY_TMAX_C = None         # None = estimation robuste par vidéo
+
+# Miroir
+MASK_RADIUS_EXPAND = 10
+
+# Contour
+CONTOUR_MIN_AREA_RATIO = 0.002
+CONTOUR_BLUR = 7
+CONTOUR_DILATE_ITERS = 2
+CONTOUR_ERODE_ITERS = 1
+CONTOUR_LINE_THICKNESS = 2
+CONTOUR_COLOR = (255, 255, 255)
+
+# Légende
+LEGEND_WIDTH = 110
+LEGEND_BAR_WIDTH = 24
+LEGEND_LEFT_PAD = 15
+LEGEND_TOP_PAD = 30
+LEGEND_BOTTOM_PAD = 30
+
+# Lissage / robustesse
+SMOOTH_SPEED_KERNEL = 7       # lissage spatial de la vitesse
+SMOOTH_TEMP_KERNEL = 5        # lissage final température
+UNCERTAINTY_KERNEL = 7        # fenêtre locale pour incertitude
+SPEED_CLIP_PERCENTILE = 99.0  # coupe les pics aberrants
+USE_CONTOUR_FOR_STATS = True  # stats dans la flamme plutôt que dans tout le miroir
+
+# Sauvegarde optionnelle de cartes compressées
+SAVE_TEMP_MAPS = False
+SAVE_ONE_EVERY_N = 10
+
+
+# =========================================================
+# UTILITAIRES
+# =========================================================
+def safe_mkdir(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def is_video_file(path: Path):
+    return path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".m4v"}
+
+
+def preprocess(gray):
+    clahe = cv2.createCLAHE(2.0, (8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    return gray
+
+
+def smooth_map(img, kernel_size):
+    if kernel_size <= 1:
+        return img
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
+
+
+# =========================================================
+# MIROIR
+# =========================================================
+def detect_circle(gray):
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=100,
+        param1=100,
+        param2=30,
+        minRadius=int(min(gray.shape) * 0.3),
+        maxRadius=int(min(gray.shape) * 0.6),
+    )
+
+    if circles is None:
+        raise RuntimeError("Cercle non détecté")
+
+    return np.uint16(np.around(circles[0][0]))
+
+
+def build_mask(shape, cx, cy, r):
+    mask = np.zeros(shape, np.uint8)
+    cv2.circle(mask, (cx, cy), r + MASK_RADIUS_EXPAND, 255, -1)
+    return mask
+
+
+def crop(img, cx, cy, r):
+    x1 = max(cx - r, 0)
+    x2 = min(cx + r, img.shape[1])
+    y1 = max(cy - r, 0)
+    y2 = min(cy + r, img.shape[0])
+    return img[y1:y2, x1:x2]
+
+
+# =========================================================
+# BACKGROUND
+# =========================================================
+def estimate_background(video, cx, cy, r, n_samples=30, stride=10):
+    cap = cv2.VideoCapture(str(video))
+    samples = []
+
+    for i in range(n_samples):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i * stride)
+        ret, f = cap.read()
+        if not ret:
+            continue
+
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, None, fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+        samples.append(crop(g, cx, cy, r))
+
+    cap.release()
+
+    if not samples:
+        raise RuntimeError("Impossible d'estimer le background")
+
+    return np.median(np.stack(samples), axis=0).astype(np.uint8)
+
+
+# =========================================================
+# CONTOUR DE FLAMME
+# =========================================================
+def get_flame_contour(gray, background, mask):
+    diff = cv2.absdiff(gray, background)
+    diff = cv2.GaussianBlur(diff, (CONTOUR_BLUR, CONTOUR_BLUR), 0)
+
+    gradx = cv2.Sobel(diff, cv2.CV_32F, 1, 0, ksize=3)
+    grady = cv2.Sobel(diff, cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.magnitude(gradx, grady)
+
+    valid = grad[mask > 0]
+    if valid.size == 0:
+        return None, np.zeros_like(gray, dtype=np.uint8)
+
+    thresh = np.percentile(valid, 85)
+
+    binary = np.zeros_like(gray, dtype=np.uint8)
+    binary[grad >= thresh] = 255
+    binary[mask == 0] = 0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    binary = cv2.dilate(binary, kernel, iterations=CONTOUR_DILATE_ITERS)
+    binary = cv2.erode(binary, kernel, iterations=CONTOUR_ERODE_ITERS)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None, binary
+
+    min_area = CONTOUR_MIN_AREA_RATIO * gray.shape[0] * gray.shape[1]
+
+    best = None
+    best_area = 0
+    for c in contours:
+        a = cv2.contourArea(c)
+        if a > best_area and a > min_area:
+            best = c
+            best_area = a
+
+    return best, binary
+
+
+def contour_to_mask(shape, contour):
+    m = np.zeros(shape, dtype=np.uint8)
+    if contour is not None:
+        cv2.drawContours(m, [contour], -1, 255, thickness=-1)
+    return m
+
+
+# =========================================================
+# MODÈLE v -> T PAR BILAN DE FORCES
+# =========================================================
+def robust_clip_speed(speed, valid_mask, percentile=SPEED_CLIP_PERCENTILE):
+    valid = speed[valid_mask > 0]
+    if valid.size == 0:
+        return speed
+    cap = np.percentile(valid, percentile)
+    return np.clip(speed, 0, cap)
+
+
+def speed_to_temperature_force_balance(speed_mps, t_bg_c=T_BACKGROUND_C, l_char=L_CHAR_M):
+    """
+    Modèle :
+        rho * v^2 / L ~ (rho_inf - rho) * g
+        => rho = rho_inf / (1 + v^2/(gL))
+
+    Avec gaz parfait à pression ~ constante :
+        rho T ~ rho_inf T_inf
+        => T = T_inf * (1 + v^2/(gL))
+
+    Retourne la température en Celsius.
+    """
+    t_bg_k = t_bg_c + 273.15
+    temp_k = t_bg_k * (1.0 + (speed_mps ** 2) / (G * l_char))
+    return temp_k - 273.15
+
+
+def temperature_uncertainty_from_speed(speed_mps, local_std_speed, t_bg_c=T_BACKGROUND_C, l_char=L_CHAR_M):
+    """
+    Propagation d'erreur :
+        T = T_inf * (1 + v^2/(gL))
+        dT/dv = T_inf * 2v/(gL)
+        deltaT ~ |dT/dv| * delta_v
+    """
+    t_bg_k = t_bg_c + 273.15
+    return t_bg_k * (2.0 * np.abs(speed_mps) / (G * l_char)) * local_std_speed
+
+
+def local_speed_uncertainty(speed_mps, kernel_size=UNCERTAINTY_KERNEL):
+    """
+    Estime l'incertitude locale sur la vitesse à partir de la variance locale.
+    """
+    mean_v = smooth_map(speed_mps, kernel_size)
+    mean_v2 = smooth_map(speed_mps ** 2, kernel_size)
+    var_v = np.maximum(mean_v2 - mean_v ** 2, 0.0)
+    return np.sqrt(var_v)
+
+
+def robust_tmax_from_video(video, cx, cy, r, mask_crop, background, n_samples=40):
+    """
+    Estime un Tmax robuste pour l'affichage.
+    """
+    cap = cv2.VideoCapture(str(video))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total <= 1:
+        cap.release()
+        return T_BACKGROUND_C + 50
+
+    indices = np.linspace(0, total - 1, min(n_samples, total)).astype(int)
+
+    prev_proc = None
+    estimates = []
+    dt = 1.0 / REAL_FPS
+
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+        ret, f = cap.read()
+        if not ret:
+            continue
+
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, None, fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+        g_crop = crop(g, cx, cy, r)
+        g_proc = preprocess(g_crop)
+
+        if prev_proc is None:
+            prev_proc = g_proc
+            continue
+
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_proc, g_proc, None,
+            PYR_SCALE, LEVELS, WINSIZE,
+            ITERATIONS, POLY_N, POLY_SIGMA, FLAGS
+        )
+
+        speed = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2) / dt * PIXEL_SIZE
+        speed = smooth_map(speed, SMOOTH_SPEED_KERNEL)
+        speed = robust_clip_speed(speed, mask_crop)
+
+        contour, _ = get_flame_contour(g_crop, background, mask_crop)
+        if contour is not None and USE_CONTOUR_FOR_STATS:
+            stat_mask = contour_to_mask(g_crop.shape, contour)
+            if np.count_nonzero(stat_mask) == 0:
+                stat_mask = mask_crop
+        else:
+            stat_mask = mask_crop
+
+        temp_c = speed_to_temperature_force_balance(speed)
+        temp_c = smooth_map(temp_c, SMOOTH_TEMP_KERNEL)
+
+        valid = temp_c[stat_mask > 0]
+        if valid.size:
+            estimates.append(np.percentile(valid, 99))
+
+        prev_proc = g_proc
+
+    cap.release()
+
+    if not estimates:
+        return T_BACKGROUND_C + 50
+
+    return float(np.median(estimates))
+
+
+def temperature_to_colormap(temp_c, mask_crop, tmin_c, tmax_c):
+    denom = max(tmax_c - tmin_c, 1e-6)
+    norm = np.clip((temp_c - tmin_c) / denom, 0, 1)
+    img = (norm * 255).astype(np.uint8)
+    color = cv2.applyColorMap(img, cv2.COLORMAP_INFERNO)
+    color[mask_crop == 0] = 0
+    return color
+
+
+# =========================================================
+# LÉGENDE
+# =========================================================
+def add_temperature_legend(image_bgr, tmin_c, tmax_c):
+    h, w = image_bgr.shape[:2]
+    out = np.zeros((h, w + LEGEND_WIDTH, 3), dtype=np.uint8)
+    out[:, :w] = image_bgr
+
+    x0 = w + LEGEND_LEFT_PAD
+    x1 = x0 + LEGEND_BAR_WIDTH
+    y0 = LEGEND_TOP_PAD
+    y1 = h - LEGEND_BOTTOM_PAD
+    bar_h = max(y1 - y0, 1)
+
+    gradient = np.linspace(255, 0, bar_h).astype(np.uint8).reshape(-1, 1)
+    gradient = np.repeat(gradient, LEGEND_BAR_WIDTH, axis=1)
+    grad_bgr = cv2.applyColorMap(gradient, cv2.COLORMAP_INFERNO)
+
+    out[y0:y1, x0:x1] = grad_bgr
+    cv2.rectangle(out, (x0, y0), (x1, y1), (255, 255, 255), 1)
+
+    n_ticks = 5
+    for i in range(n_ticks):
+        a = i / (n_ticks - 1)
+        y = int(y0 + a * (bar_h - 1))
+        t = tmax_c - a * (tmax_c - tmin_c)
+
+        cv2.line(out, (x1 + 3, y), (x1 + 10, y), (255, 255, 255), 1)
+        cv2.putText(
+            out, f"{t:.0f} C", (x1 + 14, y + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+        )
+
+    cv2.putText(
+        out,
+        "Temperature",
+        (w + 5, 18),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA
+    )
+
+    return out
+
+
+# =========================================================
+# TRAITEMENT
+# =========================================================
+def process(video):
+    video = Path(video)
+    name = video.stem
+
+    out_dir = Path(OUTPUT_ROOT) / name
+    safe_mkdir(out_dir)
+
+    if SAVE_TEMP_MAPS:
+        safe_mkdir(out_dir / "temp_maps_npz")
+
+    cap = cv2.VideoCapture(str(video))
+    ret, f0 = cap.read()
+    if not ret:
+        print(f"Impossible de lire {video}")
+        return
+
+    g0 = cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY)
+    g0 = cv2.resize(g0, None, fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+
+    cx, cy, r = detect_circle(g0)
+    full_mask = build_mask(g0.shape, cx, cy, r)
+    mask_crop = crop(full_mask, cx, cy, r)
+
+    background = estimate_background(video, cx, cy, r)
+
+    print(f"{name}: estimation de l'échelle température...")
+    tmax_c = DISPLAY_TMAX_C if DISPLAY_TMAX_C is not None else robust_tmax_from_video(
+        video, cx, cy, r, mask_crop, background
+    )
+    tmin_c = T_BACKGROUND_C
+
+    prev = preprocess(crop(g0, cx, cy, r))
+    h, w = prev.shape
+
+    writer = cv2.VideoWriter(
+        str(out_dir / "temperature_map_4fps.mp4"),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        OUTPUT_VIDEO_FPS,
+        (w + LEGEND_WIDTH, h),
+    )
+
+    dt = 1.0 / REAL_FPS
+    frame_idx = 0
+    rows = []
+
+    while True:
+        ret, f = cap.read()
+        if not ret:
+            break
+
+        g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        g = cv2.resize(g, None, fx=RESIZE_FACTOR, fy=RESIZE_FACTOR)
+
+        g_crop = crop(g, cx, cy, r)
+        g_proc = preprocess(g_crop)
+
+        flow = cv2.calcOpticalFlowFarneback(
+            prev, g_proc, None,
+            PYR_SCALE, LEVELS, WINSIZE,
+            ITERATIONS, POLY_N, POLY_SIGMA, FLAGS
+        )
+
+        # vitesse locale apparente
+        speed = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2) / dt * PIXEL_SIZE
+
+        # lissage spatial + clip robuste
+        speed = smooth_map(speed, SMOOTH_SPEED_KERNEL)
+        speed = robust_clip_speed(speed, mask_crop)
+
+        # incertitude locale sur la vitesse
+        std_v = local_speed_uncertainty(speed, UNCERTAINTY_KERNEL)
+
+        # contour de flamme
+        contour, _ = get_flame_contour(g_crop, background, mask_crop)
+
+        # température locale et incertitude locale
+        temp_c = speed_to_temperature_force_balance(speed)
+        temp_c = smooth_map(temp_c, SMOOTH_TEMP_KERNEL)
+
+        delta_t_map = temperature_uncertainty_from_speed(speed, std_v)
+        delta_t_map = smooth_map(delta_t_map, SMOOTH_TEMP_KERNEL)
+
+        # affichage
+        color = temperature_to_colormap(temp_c, mask_crop, tmin_c, tmax_c)
+
+        if contour is not None:
+            cv2.drawContours(color, [contour], -1, CONTOUR_COLOR, CONTOUR_LINE_THICKNESS)
+
+        # masque statistique
+        if contour is not None and USE_CONTOUR_FOR_STATS:
+            stat_mask = contour_to_mask(g_crop.shape, contour)
+            if np.count_nonzero(stat_mask) == 0:
+                stat_mask = mask_crop
+        else:
+            stat_mask = mask_crop
+
+        valid_t = temp_c[stat_mask > 0]
+        valid_dt = delta_t_map[stat_mask > 0]
+
+        if valid_t.size:
+            idx = int(np.argmax(valid_t))
+            max_t = float(valid_t[idx])
+            max_uncertainty = float(valid_dt[idx]) if valid_dt.size > idx else 0.0
+        else:
+            max_t = T_BACKGROUND_C
+            max_uncertainty = 0.0
+
+        cv2.putText(
+            color,
+            f"Tmax = {max_t:.0f} +/- {max_uncertainty:.0f} C",
+            (10, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        final = add_temperature_legend(color, tmin_c, tmax_c)
+        writer.write(final)
+
+        rows.append((frame_idx, max_t, max_uncertainty))
+
+        if SAVE_TEMP_MAPS and frame_idx % SAVE_ONE_EVERY_N == 0:
+            np.savez_compressed(
+                out_dir / "temp_maps_npz" / f"temp_{frame_idx:05d}.npz",
+                temp_c=temp_c.astype(np.float16),
+                delta_t_map=delta_t_map.astype(np.float16)
+            )
+
+        if frame_idx % 50 == 0:
+            print(f"{name}: frame {frame_idx}")
+
+        prev = g_proc
+        frame_idx += 1
+
+    cap.release()
+    writer.release()
+
+    with open(out_dir / "temperature_stats.csv", "w", encoding="utf-8") as f:
+        f.write("frame,max_temp_c,uncertainty_temp_c\n")
+        for fr, xt, dxt in rows:
+            f.write(f"{fr},{xt},{dxt}\n")
+
+    with open(out_dir / "info_temperature.txt", "w", encoding="utf-8") as f:
+        f.write(f"video_source: {video}\n")
+        f.write(f"T_background_C: {T_BACKGROUND_C}\n")
+        f.write(f"L_characteristic_m: {L_CHAR_M}\n")
+        f.write("model: rho*v^2/L ~ (rho_inf-rho)*g ; rho*T ~ rho_inf*T_inf\n")
+        f.write("temperature_model: T = T_inf * (1 + v^2/(gL))\n")
+        f.write("uncertainty_model: deltaT ~ |dT/dv| * deltav\n")
+        f.write(f"display_tmin_C: {tmin_c}\n")
+        f.write(f"display_tmax_C: {tmax_c}\n")
+        f.write(f"smooth_speed_kernel: {SMOOTH_SPEED_KERNEL}\n")
+        f.write(f"smooth_temp_kernel: {SMOOTH_TEMP_KERNEL}\n")
+        f.write(f"uncertainty_kernel: {UNCERTAINTY_KERNEL}\n")
+        f.write(f"speed_clip_percentile: {SPEED_CLIP_PERCENTILE}\n")
+        f.write(f"use_contour_for_stats: {USE_CONTOUR_FOR_STATS}\n")
+        f.write(f"save_temp_maps: {SAVE_TEMP_MAPS}\n")
+        f.write(f"save_one_every_n: {SAVE_ONE_EVERY_N}\n")
+
+    print(f"✅ terminé: {name}")
+
+
+# =========================================================
+# MAIN
+# =========================================================
+def main():
+    input_path = Path(INPUT_PATH)
+    safe_mkdir(OUTPUT_ROOT)
+
+    if input_path.is_file() and is_video_file(input_path):
+        process(input_path)
+
+    elif input_path.is_dir():
+        for v in sorted(input_path.iterdir()):
+            if v.is_file() and is_video_file(v):
+                try:
+                    process(v)
+                except Exception as e:
+                    print(f"❌ erreur pour {v.name}: {e}")
+    else:
+        print("INPUT_PATH invalide")
+
+
+if __name__ == "__main__":
+    main()
