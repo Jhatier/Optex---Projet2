@@ -4,19 +4,16 @@ import cv2
 import numpy as np
 
 
-# =========================================================
-# CONFIG
-# =========================================================
 INPUT_PATH = "Vidéos_traitées"
 OUTPUT_ROOT = "video_traitee_temperature"
 
-# Vidéo / calibration
+# Paramètres de la vidéo
 REAL_FPS = 30
 PIXEL_SIZE = 4.43e-4          # m/pixel
 OUTPUT_VIDEO_FPS = 4
 RESIZE_FACTOR = 0.7
 
-# Farneback
+# Paramètres de l'algorithme Farnback, qui permet d'estimer l'allure du flot 
 PYR_SCALE = 0.5
 LEVELS = 3
 WINSIZE = 15
@@ -25,18 +22,15 @@ POLY_N = 5
 POLY_SIGMA = 1.2
 FLAGS = 0
 
-# Modèle thermique par bilan de forces
+# Paramètres du modèle théorique
 T_BACKGROUND_C = 20.0
 G = 9.81
 L_CHAR_M = 0.008               # longueur caractéristique ; à ajuster
 
-# Échelle visuelle
-DISPLAY_TMAX_C = None         # None = estimation robuste par vidéo
-
 # Miroir
 MASK_RADIUS_EXPAND = 10
 
-# Contour
+# Contour des flammes
 CONTOUR_MIN_AREA_RATIO = 0.002
 CONTOUR_BLUR = 7
 CONTOUR_DILATE_ITERS = 2
@@ -58,14 +52,7 @@ UNCERTAINTY_KERNEL = 7        # fenêtre locale pour incertitude
 SPEED_CLIP_PERCENTILE = 99.0  # coupe les pics aberrants
 USE_CONTOUR_FOR_STATS = True  # stats dans la flamme plutôt que dans tout le miroir
 
-# Sauvegarde optionnelle de cartes compressées
-SAVE_TEMP_MAPS = False
-SAVE_ONE_EVERY_N = 10
 
-
-# =========================================================
-# UTILITAIRES
-# =========================================================
 def safe_mkdir(path):
     os.makedirs(path, exist_ok=True)
 
@@ -89,9 +76,6 @@ def smooth_map(img, kernel_size):
     return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
 
 
-# =========================================================
-# MIROIR
-# =========================================================
 def detect_circle(gray):
     blurred = cv2.GaussianBlur(gray, (9, 9), 2)
 
@@ -125,10 +109,7 @@ def crop(img, cx, cy, r):
     y2 = min(cy + r, img.shape[0])
     return img[y1:y2, x1:x2]
 
-
-# =========================================================
-# BACKGROUND
-# =========================================================
+#La fonction suivante sépare le background de la flamme 
 def estimate_background(video, cx, cy, r, n_samples=30, stride=10):
     cap = cv2.VideoCapture(str(video))
     samples = []
@@ -151,9 +132,7 @@ def estimate_background(video, cx, cy, r, n_samples=30, stride=10):
     return np.median(np.stack(samples), axis=0).astype(np.uint8)
 
 
-# =========================================================
-# CONTOUR DE FLAMME
-# =========================================================
+#La fonction suivante détermine, grosso modo, le contour de la flamme
 def get_flame_contour(gray, background, mask):
     diff = cv2.absdiff(gray, background)
     diff = cv2.GaussianBlur(diff, (CONTOUR_BLUR, CONTOUR_BLUR), 0)
@@ -202,9 +181,6 @@ def contour_to_mask(shape, contour):
     return m
 
 
-# =========================================================
-# MODÈLE v -> T PAR BILAN DE FORCES
-# =========================================================
 def robust_clip_speed(speed, valid_mask, percentile=SPEED_CLIP_PERCENTILE):
     valid = speed[valid_mask > 0]
     if valid.size == 0:
@@ -212,7 +188,7 @@ def robust_clip_speed(speed, valid_mask, percentile=SPEED_CLIP_PERCENTILE):
     cap = np.percentile(valid, percentile)
     return np.clip(speed, 0, cap)
 
-
+#Modèle de température basée sur la vitesse
 def speed_to_temperature_force_balance(speed_mps, t_bg_c=T_BACKGROUND_C, l_char=L_CHAR_M):
     """
     Modèle :
@@ -229,7 +205,7 @@ def speed_to_temperature_force_balance(speed_mps, t_bg_c=T_BACKGROUND_C, l_char=
     temp_k = t_bg_k * (1.0 + (speed_mps ** 2) / (G * l_char))
     return temp_k - 273.15
 
-
+#Incertitude de la température
 def temperature_uncertainty_from_speed(speed_mps, local_std_speed, t_bg_c=T_BACKGROUND_C, l_char=L_CHAR_M):
     """
     Propagation d'erreur :
@@ -250,7 +226,7 @@ def local_speed_uncertainty(speed_mps, kernel_size=UNCERTAINTY_KERNEL):
     var_v = np.maximum(mean_v2 - mean_v ** 2, 0.0)
     return np.sqrt(var_v)
 
-
+#Température maximale de la flamme, si ça peut servir
 def robust_tmax_from_video(video, cx, cy, r, mask_crop, background, n_samples=40):
     """
     Estime un Tmax robuste pour l'affichage.
@@ -325,10 +301,7 @@ def temperature_to_colormap(temp_c, mask_crop, tmin_c, tmax_c):
     color[mask_crop == 0] = 0
     return color
 
-
-# =========================================================
-# LÉGENDE
-# =========================================================
+#Légende
 def add_temperature_legend(image_bgr, tmin_c, tmax_c):
     h, w = image_bgr.shape[:2]
     out = np.zeros((h, w + LEGEND_WIDTH, 3), dtype=np.uint8)
@@ -373,18 +346,13 @@ def add_temperature_legend(image_bgr, tmin_c, tmax_c):
     return out
 
 
-# =========================================================
-# TRAITEMENT
-# =========================================================
+#Traitement vidéo
 def process(video):
     video = Path(video)
     name = video.stem
 
     out_dir = Path(OUTPUT_ROOT) / name
     safe_mkdir(out_dir)
-
-    if SAVE_TEMP_MAPS:
-        safe_mkdir(out_dir / "temp_maps_npz")
 
     cap = cv2.VideoCapture(str(video))
     ret, f0 = cap.read()
@@ -402,7 +370,7 @@ def process(video):
     background = estimate_background(video, cx, cy, r)
 
     print(f"{name}: estimation de l'échelle température...")
-    tmax_c = DISPLAY_TMAX_C if DISPLAY_TMAX_C is not None else robust_tmax_from_video(
+    tmax_c = robust_tmax_from_video(
         video, cx, cy, r, mask_crop, background
     )
     tmin_c = T_BACKGROUND_C
@@ -499,13 +467,7 @@ def process(video):
 
         rows.append((frame_idx, max_t, max_uncertainty))
 
-        if SAVE_TEMP_MAPS and frame_idx % SAVE_ONE_EVERY_N == 0:
-            np.savez_compressed(
-                out_dir / "temp_maps_npz" / f"temp_{frame_idx:05d}.npz",
-                temp_c=temp_c.astype(np.float16),
-                delta_t_map=delta_t_map.astype(np.float16)
-            )
-
+       
         if frame_idx % 50 == 0:
             print(f"{name}: frame {frame_idx}")
 
@@ -534,15 +496,10 @@ def process(video):
         f.write(f"uncertainty_kernel: {UNCERTAINTY_KERNEL}\n")
         f.write(f"speed_clip_percentile: {SPEED_CLIP_PERCENTILE}\n")
         f.write(f"use_contour_for_stats: {USE_CONTOUR_FOR_STATS}\n")
-        f.write(f"save_temp_maps: {SAVE_TEMP_MAPS}\n")
-        f.write(f"save_one_every_n: {SAVE_ONE_EVERY_N}\n")
 
-    print(f"✅ terminé: {name}")
+    print(f"terminé: {name}")
 
 
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     input_path = Path(INPUT_PATH)
     safe_mkdir(OUTPUT_ROOT)
@@ -556,7 +513,7 @@ def main():
                 try:
                     process(v)
                 except Exception as e:
-                    print(f"❌ erreur pour {v.name}: {e}")
+                    print(f"erreur pour {v.name}: {e}")
     else:
         print("INPUT_PATH invalide")
 

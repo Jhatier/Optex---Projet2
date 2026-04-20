@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 from pathlib import Path
 
+#Ce fichier permet de cropper les vidéos en carré, histoire de pouvoir avoir un bon format de vidéo
 
 video_path = Path("Vidéos_brutes/Bougie-rose (2).MOV")
 
@@ -9,10 +10,10 @@ output_folder = Path("Vidéos_traitées")
 output_folder.mkdir(exist_ok=True)
 
 display_scale = 0.4
-background_threshold = 25
-show_preview = True
+background_threshold = 25 #Paramètres de contraste pour différencier l'image du miroir et permettre de cadrer l'image
+show_preview = True 
 
-clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) #Format de contraste
 
 
 video = cv2.VideoCapture(str(video_path))
@@ -26,7 +27,7 @@ if not ret:
     print(f"Aucune frame lisible dans {video_path.name}")
     video.release()
     
-h, w = frame.shape[:2]
+h, w = frame.shape[:2] #Centrer l'image 
 size = min(h, w)
 center_y, center_x = h // 2, w // 2
 y1 = center_y - size // 2

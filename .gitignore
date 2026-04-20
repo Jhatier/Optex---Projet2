@@ -2,3 +2,5 @@ video_traitee_temperature/
 video_traitee_vitesse/
 Vidéos_brutes/
 Vidéos_traitées/
+*.mp4
+*.mov

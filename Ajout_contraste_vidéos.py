@@ -2,25 +2,27 @@ import cv2
 import numpy as np
 from pathlib import Path
 
-# ========= PARAMÈTRES =========
 input_folder = Path("videos_entree")
 output_folder = Path("videos_traitees")
 output_folder.mkdir(exist_ok=True)
 
 video_extensions = {".mp4", ".mov", ".avi", ".mkv"}
 
-# seuil pour détecter le fond noir
+# Seuil de contraste pour détecter le fond noir
 background_threshold = 25
 
-# renforcement de contraste dans la zone utile
+# Renforcement de contraste dans le miroir
 alpha = 1.4   # contraste
 beta = -10    # luminosité
 
-# ========= FONCTION DE TRAITEMENT =========
+
+#La fonction qui suit permet d'appliquer le contraste sur chaque image en la convertissant en niveaux de gris et
+#en comparant au background_threshold
+
 def process_frame(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Détection du fond noir
+    
     background_mask = gray < background_threshold
 
     # Amélioration douce du contraste
@@ -34,7 +36,7 @@ def process_frame(frame):
 
     return result
 
-# ========= TRAITEMENT DES VIDÉOS =========
+    #On applique process_frame sur chaque image de chaque vidéo!
 for video_path in input_folder.iterdir():
     if video_path.suffix.lower() not in video_extensions:
         continue

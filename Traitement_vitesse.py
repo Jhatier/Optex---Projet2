@@ -4,9 +4,6 @@ import cv2
 import numpy as np
 
 
-# =========================
-# CONFIG
-# =========================
 INPUT_PATH = "Vidéos_traitées"
 OUTPUT_ROOT = "video_traitee_vitesse"
 
@@ -16,7 +13,6 @@ OUTPUT_VIDEO_FPS = 4
 
 RESIZE_FACTOR = 0.7
 
-# Farneback (rapide + stable)
 PYR_SCALE = 0.5
 LEVELS = 3
 WINSIZE = 15
@@ -24,14 +20,10 @@ ITERATIONS = 3
 POLY_N = 5
 POLY_SIGMA = 1.2
 
-# Contour
 CONTOUR_METHOD = "background_gradient"
 CONTOUR_MIN_AREA_RATIO = 0.002
 
 
-# =========================
-# UTILITAIRES
-# =========================
 def safe_mkdir(p):
     os.makedirs(p, exist_ok=True)
 
@@ -46,9 +38,6 @@ def preprocess(gray):
     return cv2.GaussianBlur(gray, (5, 5), 0)
 
 
-# =========================
-# MIROIR
-# =========================
 def detect_circle(gray):
     blurred = cv2.GaussianBlur(gray, (9, 9), 2)
 
@@ -83,9 +72,6 @@ def crop(gray, cx, cy, r):
     return gray[y1:y2, x1:x2]
 
 
-# =========================
-# COLORMAP PROPRE
-# =========================
 def speed_to_colormap(vx, vy, mask):
     speed = np.sqrt(vx**2 + vy**2)
     speed = cv2.GaussianBlur(speed, (7, 7), 0)
@@ -111,9 +97,6 @@ def speed_to_colormap(vx, vy, mask):
     return color, speed
 
 
-# =========================
-# CONTOUR FLAMME
-# =========================
 def get_contour(gray, background, speed, mask):
     diff = cv2.absdiff(gray, background)
     diff = cv2.GaussianBlur(diff, (7, 7), 0)
@@ -150,9 +133,6 @@ def get_contour(gray, background, speed, mask):
     return best
 
 
-# =========================
-# BACKGROUND
-# =========================
 def estimate_background(video, cx, cy, r):
     cap = cv2.VideoCapture(str(video))
     samples = []
@@ -172,9 +152,6 @@ def estimate_background(video, cx, cy, r):
     return np.median(np.stack(samples), axis=0).astype(np.uint8)
 
 
-# =========================
-# TRAITEMENT
-# =========================
 def process(video):
     video = Path(video)
     name = video.stem
@@ -232,7 +209,6 @@ def process(video):
 
         color, speed = speed_to_colormap(vx, vy, crop(mask, cx, cy, r))
 
-        # 🔥 CONTOUR
         contour = get_contour(g_crop, background, speed, crop(mask, cx, cy, r))
 
         if contour is not None:
@@ -245,12 +221,9 @@ def process(video):
     cap.release()
     writer.release()
 
-    print("✅ terminé:", name)
+    print("terminé:", name)
 
 
-# =========================
-# MAIN
-# =========================
 def main():
     p = Path(INPUT_PATH)
     safe_mkdir(OUTPUT_ROOT)
